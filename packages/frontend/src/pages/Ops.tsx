@@ -65,13 +65,13 @@ export default function Ops() {
   )
 }
 
-function OpsCard({ 
-  icon: Icon, 
-  title, 
-  description, 
-  variant 
-}: { 
-  icon: React.ComponentType<{ size?: number; className?: string }>
+function OpsCard({
+  icon: Icon,
+  title,
+  description,
+  variant
+}: {
+  icon: React.ComponentType<{ size?: number | string; className?: string }>
   title: string
   description: string
   variant: 'primary' | 'warning' | 'danger' | 'default'

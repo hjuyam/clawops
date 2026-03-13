@@ -1,4 +1,4 @@
-import { Link2, Wifi, WifiOff, Server, Globe } from 'lucide-react'
+import { Wifi, WifiOff, Server, Globe } from 'lucide-react'
 
 export default function Connect() {
   return (

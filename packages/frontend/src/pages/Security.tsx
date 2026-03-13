@@ -136,9 +136,9 @@ function SecurityToggle({ label, enabled }: { label: string; enabled: boolean })
   )
 }
 
-function ActionButton({ icon: Icon, label }: { 
-  icon: React.ComponentType<{ size?: number; className?: string }>
-  label: string 
+function ActionButton({ icon: Icon, label }: {
+  icon: React.ComponentType<{ size?: number | string; className?: string }>
+  label: string
 }) {
   return (
     <button className="flex items-center gap-2 px-4 py-3 bg-slate-100 hover:bg-slate-200 rounded-lg text-slate-700 transition-colors">

@@ -1,4 +1,4 @@
-import { Search, Trash2, Pin, Calendar, Filter } from 'lucide-react'
+import { Search, Trash2, Pin, Filter } from 'lucide-react'
 
 export default function Memory() {
   return (

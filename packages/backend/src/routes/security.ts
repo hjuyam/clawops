@@ -1,97 +1,60 @@
 import { Router } from 'express'
+import { requireAuth, AuthRequest } from '../middleware/auth.js'
+import { queries, AuditLog, Session } from '../db/index.js'
 
 const router = Router()
 
-interface AuditLog {
-  event_id: string
-  event_time: string
-  actor_type: string
-  actor_id: string
-  actor_ip: string
-  action: string
-  resource_type: string
-  resource_id: string
-  status: 'success' | 'failure'
-  details?: Record<string, unknown>
-}
-
-const auditLogs: AuditLog[] = [
-  {
-    event_id: 'evt_001',
-    event_time: new Date(Date.now() - 600000).toISOString(),
-    actor_type: 'user',
-    actor_id: 'admin',
-    actor_ip: '127.0.0.1',
-    action: 'config_change',
-    resource_type: 'config',
-    resource_id: 'model.yaml',
-    status: 'success',
-  },
-  {
-    event_id: 'evt_002',
-    event_time: new Date(Date.now() - 3600000).toISOString(),
-    actor_type: 'user',
-    actor_id: 'admin',
-    actor_ip: '127.0.0.1',
-    action: 'login',
-    resource_type: 'session',
-    resource_id: 'sess_001',
-    status: 'success',
-  },
-]
-
-router.get('/logs', (req, res) => {
-  const { action, actor, status, from, to } = req.query
+router.get('/logs', requireAuth, (req: AuthRequest, res) => {
+  const { action, actor_id, status, limit = 100, offset = 0 } = req.query
   
-  let filtered = [...auditLogs]
+  let logs = queries.auditLogs.list.all({ limit: Number(limit), offset: Number(offset) }) as AuditLog[]
   
   if (action) {
-    filtered = filtered.filter(l => l.action === action)
+    logs = logs.filter(l => l.action === action)
   }
   
-  if (actor) {
-    filtered = filtered.filter(l => l.actor_id === actor)
+  if (actor_id) {
+    logs = logs.filter(l => l.actor_id === actor_id)
   }
   
   if (status) {
-    filtered = filtered.filter(l => l.status === status)
+    logs = logs.filter(l => l.status === status)
   }
   
-  if (from) {
-    filtered = filtered.filter(l => new Date(l.event_time) >= new Date(String(from)))
-  }
-  
-  if (to) {
-    filtered = filtered.filter(l => new Date(l.event_time) <= new Date(String(to)))
-  }
-  
-  res.json({ success: true, data: filtered })
+  res.json({ success: true, data: logs })
 })
 
-router.post('/logs', (req, res) => {
-  const log: AuditLog = {
-    event_id: `evt_${Date.now()}`,
-    event_time: new Date().toISOString(),
-    actor_type: req.body.actor_type || 'system',
-    actor_id: req.body.actor_id || 'system',
-    actor_ip: req.ip || '127.0.0.1',
-    action: req.body.action,
-    resource_type: req.body.resource_type,
-    resource_id: req.body.resource_id,
-    status: req.body.status || 'success',
-    details: req.body.details,
+router.get('/logs/:id', requireAuth, (req: AuthRequest, res) => {
+  const allLogs = queries.auditLogs.list.all({ limit: 10000, offset: 0 }) as AuditLog[]
+  const log = allLogs.find(l => l.event_id === req.params.id)
+  
+  if (!log) {
+    return res.status(404).json({ success: false, error: 'Log not found' })
   }
   
-  auditLogs.unshift(log)
-  res.status(201).json({ success: true, data: log })
+  res.json({ success: true, data: log })
 })
 
-router.get('/score', (_req, res) => {
+router.get('/score', requireAuth, (_req, res) => {
+  const logs = queries.auditLogs.list.all({ limit: 100, offset: 0 }) as AuditLog[]
+  
+  const failedActions = logs.filter(l => l.status === 'failure').length
+  const highRiskActions = logs.filter(l => l.risk_level === 'high').length
+  
+  let score = 100
+  score -= failedActions * 2
+  score -= highRiskActions * 1
+  score = Math.max(0, Math.min(100, score))
+  
+  let status: 'good' | 'warning' | 'danger' = 'good'
+  if (score < 70) status = 'danger'
+  else if (score < 90) status = 'warning'
+  
   res.json({
     success: true,
     data: {
-      score: 85,
-      status: 'good',
+      score,
+      status,
       checks: {
         totp_enabled: true,
         session_management: true,
@@ -104,27 +67,37 @@ router.get('/score', (_req, res) => {
   })
 })
 
-router.get('/sessions', (_req, res) => {
+router.get('/sessions', requireAuth, (req: AuthRequest, res) => {
+  if (!req.user) {
+    return res.status(401).json({ success: false, error: 'Not authenticated' })
+  }
+  
+  const sessions = queries.sessions.listByUser.all(req.user.id) as Session[]
+
   res.json({
     success: true,
-    data: [
-      {
-        session_id: 'sess_001',
-        user_id: 'admin',
-        created_at: new Date(Date.now() - 3600000).toISOString(),
-        last_active: new Date().toISOString(),
-        ip: '127.0.0.1',
-        user_agent: 'Mozilla/5.0',
-      },
-    ],
+    data: sessions.map(s => ({
+      id: s.id,
+      ip_address: s.ip_address,
+      user_agent: s.user_agent,
+      created_at: s.created_at,
+      last_active: s.last_active,
+      expires_at: s.expires_at,
+    })),
   })
 })
 
-router.delete('/sessions/:id', (req, res) => {
-  res.json({
-    success: true,
-    data: { message: `Session ${req.params.id} terminated` },
-  })
+router.delete('/sessions/:id', requireAuth, (req: AuthRequest, res) => {
+  queries.sessions.delete.run(req.params.id)
+  res.json({ success: true, data: { message: 'Session terminated' } })
+})
+
+router.get('/export', requireAuth, (req: AuthRequest, res) => {
+  const logs = queries.auditLogs.list.all({ limit: 10000, offset: 0 })
+  
+  res.setHeader('Content-Type', 'application/json')
+  res.setHeader('Content-Disposition', 'attachment; filename=audit_logs.json')
+  res.json(logs)
 })
 
 export { router as securityRouter }

@@ -1,4 +1,4 @@
-import { Play, Square, Clock, ChevronRight } from 'lucide-react'
+import { Play, ChevronRight } from 'lucide-react'
 
 export default function Tasks() {
   return (
@@ -65,8 +65,10 @@ const mockRuns = [
   { id: 'run_004', task: 'backup', status: 'failed', duration: '0m 10s', time: '2 hours ago' },
 ]
 
+type RunStatus = 'completed' | 'running' | 'failed' | 'pending'
+
 function RunItem({ run }: { run: typeof mockRuns[0] }) {
-  const statusColors = {
+  const statusColors: Record<RunStatus, string> = {
     completed: 'bg-green-100 text-green-700',
     running: 'bg-blue-100 text-blue-700',
     failed: 'bg-red-100 text-red-700',
@@ -78,7 +80,7 @@ function RunItem({ run }: { run: typeof mockRuns[0] }) {
       <div className="flex-1">
         <div className="flex items-center gap-3">
           <span className="font-mono text-sm text-slate-600">{run.id}</span>
-          <span className={`px-2 py-0.5 text-xs rounded ${statusColors[run.status]}`}>
+          <span className={`px-2 py-0.5 text-xs rounded ${statusColors[run.status as RunStatus]}`}>
             {run.status}
           </span>
         </div>

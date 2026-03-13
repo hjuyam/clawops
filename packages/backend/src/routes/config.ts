@@ -1,143 +1,135 @@
 import { Router } from 'express'
+import { requireAuth, AuthRequest } from '../middleware/auth.js'
+import { queries } from '../db/index.js'
+import { createAuditLog } from '../services/auth.js'
 import { v4 as uuidv4 } from 'uuid'
 
 const router = Router()
 
-interface ConfigVersion {
-  version: string
-  hash: string
-  created_at: string
-  content: Record<string, unknown>
-}
+const CONFIG_FILES = [
+  { name: 'SOUL', path: 'SOUL.md', description: 'Core identity configuration' },
+  { name: 'AGENTS', path: 'AGENTS.md', description: 'Subagent definitions' },
+  { name: 'USER', path: 'USER.md', description: 'User preferences' },
+  { name: 'IDENTITY', path: 'IDENTITY.md', description: 'System identity' },
+  { name: 'HEARTBEAT', path: 'HEARTBEAT.md', description: 'Scheduled tasks config' },
+]
 
-const configVersions: Map<string, ConfigVersion> = new Map()
+router.get('/list', requireAuth, (_req: AuthRequest, res) => {
+  const files = CONFIG_FILES.map(f => {
+    const latest = queries.configVersions.getLatest.get(f.path) as { version: string; created_at: string } | undefined
+    return {
+      ...f,
+      exists: !!latest,
+      version: latest?.version,
+      last_modified: latest?.created_at,
+    }
+  })
+  
+  res.json({ success: true, data: files })
+})
 
-const currentConfig: ConfigVersion = {
-  version: 'v1.0.0',
-  hash: uuidv4(),
-  created_at: new Date().toISOString(),
-  content: {
-    model: {
-      provider: 'openai',
-      model: 'gpt-4',
-      fallback: 'gpt-3.5-turbo',
-    },
-    budget: {
-      limit: 100,
-      period: 'monthly',
-    },
-    security: {
-      totp_enabled: true,
-      session_expiry: 3600,
-    },
-  },
-}
-
-configVersions.set(currentConfig.version, currentConfig)
-
-router.get('/current', (_req, res) => {
+router.get('/file/:path', requireAuth, (req: AuthRequest, res) => {
+  const { path: filePath } = req.params
+  const version = queries.configVersions.getLatest.get(filePath)
+  
+  if (!version) {
+    return res.json({ success: true, data: { content: '', version: null } })
+  }
+  
   res.json({ 
     success: true, 
-    data: {
-      current_version: currentConfig.version,
-      etag: currentConfig.hash,
-      config: currentConfig.content,
+    data: { 
+      content: (version as { content: string }).content,
+      version: (version as { version: string }).version,
+      hash: (version as { hash: string }).hash,
+      created_at: (version as { created_at: string }).created_at,
     }
   })
 })
 
-router.post('/preview_diff', (req, res) => {
-  const { old_version, new_config } = req.body
+router.post('/save', requireAuth, (req: AuthRequest, res) => {
+  const { path: filePath, content, reason } = req.body
   
-  const diff = {
-    old_version,
-    changes: Object.keys(new_config).map(key => ({
-      path: key,
-      old_value: '[REDACTED]',
-      new_value: '[REDACTED]',
-    })),
+  if (!filePath || content === undefined) {
+    return res.status(400).json({ success: false, error: 'Path and content are required' })
   }
-  
-  res.json({ success: true, data: diff })
-})
-
-router.post('/apply', (req, res) => {
-  const { base_version, new_config, reason } = req.body
   
   if (!reason) {
-    return res.status(400).json({ 
-      success: false, 
-      error: 'Reason is required for config changes' 
-    })
+    return res.status(400).json({ success: false, error: 'Reason is required for config changes' })
   }
   
-  const backup: ConfigVersion = {
-    version: `v${Date.now()}`,
-    hash: uuidv4(),
-    created_at: new Date().toISOString(),
-    content: { ...currentConfig.content },
-  }
+  const versionId = uuidv4()
+  const version = `v${Date.now()}`
+  const hash = require('crypto').createHash('sha256').update(content).digest('hex')
   
-  configVersions.set(backup.version, backup)
+  queries.configVersions.create.run({
+    id: versionId,
+    version,
+    hash,
+    file_path: filePath,
+    content,
+    created_by: req.user?.id,
+  })
   
-  const newVersion: ConfigVersion = {
-    version: `v${Date.now()}`,
-    hash: uuidv4(),
-    created_at: new Date().toISOString(),
-    content: new_config,
-  }
-  
-  configVersions.set(newVersion.version, newVersion)
+  createAuditLog({
+    actor_id: req.user?.id,
+    action: 'config_save',
+    resource_type: 'config_file',
+    resource_id: filePath,
+    reason,
+    risk_level: 'high',
+  })
   
   res.json({ 
     success: true, 
-    data: {
-      previous_version: currentConfig.version,
-      new_version: newVersion.version,
-      backup_version: backup.version,
-      message: 'Config applied successfully',
+    data: { 
+      message: 'Configuration saved',
+      version,
+      version_id: versionId,
     }
   })
 })
 
-router.post('/rollback', (req, res) => {
-  const { target_version, reason } = req.body
-  
-  if (!reason) {
-    return res.status(400).json({ 
-      success: false, 
-      error: 'Reason is required for rollback' 
-    })
-  }
-  
-  const targetConfig = configVersions.get(target_version)
-  if (!targetConfig) {
-    return res.status(404).json({ 
-      success: false, 
-      error: 'Target version not found' 
-    })
-  }
-  
-  res.json({ 
-    success: true, 
-    data: {
-      rolled_back_to: target_version,
-      timestamp: new Date().toISOString(),
-      message: 'Rollback completed successfully',
-    }
-  })
-})
-
-router.get('/versions', (_req, res) => {
-  const versions = Array.from(configVersions.values())
-    .map(v => ({
-      version: v.version,
-      hash: v.hash,
-      created_at: v.created_at,
-    }))
-    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+router.get('/versions/:path', requireAuth, (req: AuthRequest, res) => {
+  const { path: filePath } = req.params
+  const versions = queries.configVersions.findByPath.all(filePath)
   
   res.json({ success: true, data: versions })
+})
+
+router.post('/rollback', requireAuth, (req: AuthRequest, res) => {
+  const { path: filePath, version_id, reason } = req.body
+  
+  if (!filePath || !version_id) {
+    return res.status(400).json({ success: false, error: 'Path and version_id are required' })
+  }
+  
+  if (!reason) {
+    return res.status(400).json({ success: false, error: 'Reason is required for rollback' })
+  }
+  
+  const targetVersion = queries.configVersions.findById.get(version_id)
+  if (!targetVersion) {
+    return res.status(404).json({ success: false, error: 'Target version not found' })
+  }
+  
+  createAuditLog({
+    actor_id: req.user?.id,
+    action: 'config_rollback',
+    resource_type: 'config_file',
+    resource_id: filePath,
+    before_ref: (targetVersion as { version: string }).version,
+    reason,
+    risk_level: 'high',
+  })
+  
+  res.json({ 
+    success: true, 
+    data: { 
+      message: 'Rollback completed',
+      rolled_back_to: (targetVersion as { version: string }).version,
+    }
+  })
 })
 
 export { router as configRouter }

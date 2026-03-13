@@ -1,108 +1,143 @@
 import { Router } from 'express'
+import { requireAuth, AuthRequest } from '../middleware/auth.js'
+import { queries, Memory } from '../db/index.js'
+import { v4 as uuidv4 } from 'uuid'
+import { createAuditLog } from '../services/auth.js'
 
 const router = Router()
 
-interface Memory {
-  id: string
-  title: string
-  content: string
-  source: 'conversation' | 'task' | 'web' | 'file'
-  created_at: string
-  pinned: boolean
-}
-
-const memories: Memory[] = [
-  {
-    id: 'mem_001',
-    title: 'API Integration Notes',
-    content: 'Details about API integration patterns...',
-    source: 'conversation',
-    created_at: new Date(Date.now() - 600000).toISOString(),
-    pinned: true,
-  },
-  {
-    id: 'mem_002',
-    title: 'Debug Session - Auth Issue',
-    content: 'Resolved authentication token issue...',
-    source: 'task',
-    created_at: new Date(Date.now() - 3600000).toISOString(),
-    pinned: false,
-  },
-]
-
-router.get('/', (req, res) => {
-  const { source, search, pinned } = req.query
+router.get('/', requireAuth, (req: AuthRequest, res) => {
+  const { source, pinned, limit = 50, offset = 0 } = req.query
   
-  let filtered = [...memories]
+  let memories = queries.memories.list.all({ limit: Number(limit), offset: Number(offset) }) as Memory[]
   
   if (source && source !== 'all') {
-    filtered = filtered.filter(m => m.source === source)
-  }
-  
-  if (search) {
-    const searchLower = String(search).toLowerCase()
-    filtered = filtered.filter(m => 
-      m.title.toLowerCase().includes(searchLower) ||
-      m.content.toLowerCase().includes(searchLower)
-    )
+    memories = memories.filter(m => m.source === source)
   }
   
   if (pinned === 'true') {
-    filtered = filtered.filter(m => m.pinned)
+    memories = memories.filter(m => m.pinned === 1)
   }
   
-  res.json({ success: true, data: filtered })
+  res.json({ success: true, data: memories })
 })
 
-router.post('/', (req, res) => {
-  const { title, content, source } = req.body
+router.post('/', requireAuth, (req: AuthRequest, res) => {
+  const { title, content, source, retention_days } = req.body
   
-  const memory: Memory = {
-    id: `mem_${Date.now()}`,
-    title,
-    content,
-    source: source || 'conversation',
-    created_at: new Date().toISOString(),
-    pinned: false,
+  if (!title) {
+    return res.status(400).json({ success: false, error: 'Title is required' })
   }
   
-  memories.unshift(memory)
+  const id = uuidv4()
+  const expiresAt = retention_days 
+    ? new Date(Date.now() + retention_days * 24 * 60 * 60 * 1000).toISOString()
+    : null
+  
+  queries.memories.create.run({
+    id,
+    title,
+    content: content || '',
+    source: source || 'conversation',
+    retention_days: retention_days || 30,
+    expires_at: expiresAt,
+  })
+  
+  createAuditLog({
+    actor_id: req.user?.id,
+    action: 'memory_create',
+    resource_type: 'memory',
+    resource_id: id,
+  })
+  
+  const memory = queries.memories.findById.get(id)
   res.status(201).json({ success: true, data: memory })
 })
 
-router.delete('/:id', (req, res) => {
-  const index = memories.findIndex(m => m.id === req.params.id)
-  if (index === -1) {
-    return res.status(404).json({ success: false, error: 'Memory not found' })
+router.get('/search', requireAuth, (req: AuthRequest, res) => {
+  const { q, limit = 20 } = req.query
+  
+  if (!q) {
+    return res.status(400).json({ success: false, error: 'Search query is required' })
   }
   
-  memories.splice(index, 1)
-  res.json({ success: true, data: { message: 'Memory deleted' } })
+  const memories = queries.memories.search.all({ query: String(q), limit: Number(limit) })
+  res.json({ success: true, data: memories })
 })
 
-router.post('/:id/pin', (req, res) => {
-  const memory = memories.find(m => m.id === req.params.id)
+router.get('/:id', requireAuth, (req: AuthRequest, res) => {
+  const memory = queries.memories.findById.get(req.params.id)
+  
   if (!memory) {
     return res.status(404).json({ success: false, error: 'Memory not found' })
   }
   
-  memory.pinned = !memory.pinned
   res.json({ success: true, data: memory })
 })
 
-router.get('/stats', (_req, res) => {
+router.patch('/:id', requireAuth, (req: AuthRequest, res) => {
+  const { title, content, pinned } = req.body
+  
+  const memory = queries.memories.findById.get(req.params.id)
+  if (!memory) {
+    return res.status(404).json({ success: false, error: 'Memory not found' })
+  }
+  
+  queries.memories.update.run({
+    id: req.params.id,
+    title,
+    content,
+    pinned: pinned !== undefined ? (pinned ? 1 : 0) : undefined,
+  })
+  
+  const updated = queries.memories.findById.get(req.params.id)
+  res.json({ success: true, data: updated })
+})
+
+router.delete('/:id', requireAuth, (req: AuthRequest, res) => {
+  const memory = queries.memories.findById.get(req.params.id)
+  if (!memory) {
+    return res.status(404).json({ success: false, error: 'Memory not found' })
+  }
+  
+  queries.memories.delete.run(req.params.id)
+  
+  createAuditLog({
+    actor_id: req.user?.id,
+    action: 'memory_delete',
+    resource_type: 'memory',
+    resource_id: req.params.id,
+    risk_level: 'medium',
+  })
+  
+  res.json({ success: true, data: { message: 'Memory deleted' } })
+})
+
+router.post('/:id/pin', requireAuth, (req: AuthRequest, res) => {
+  const memory = queries.memories.findById.get(req.params.id) as Memory | undefined
+  if (!memory) {
+    return res.status(404).json({ success: false, error: 'Memory not found' })
+  }
+
+  queries.memories.update.run({
+    id: req.params.id,
+    pinned: memory.pinned === 1 ? 0 : 1,
+  })
+
+  const updated = queries.memories.findById.get(req.params.id)
+  res.json({ success: true, data: updated })
+})
+
+router.get('/stats/overview', requireAuth, (_req, res) => {
+  const all = queries.memories.list.all({ limit: 10000, offset: 0 }) as Memory[]
+  const pinned = all.filter((m: Memory) => m.pinned === 1).length
+  
   res.json({
     success: true,
     data: {
-      total: memories.length,
-      pinned: memories.filter(m => m.pinned).length,
-      by_source: {
-        conversation: memories.filter(m => m.source === 'conversation').length,
-        task: memories.filter(m => m.source === 'task').length,
-        web: memories.filter(m => m.source === 'web').length,
-        file: memories.filter(m => m.source === 'file').length,
-      },
-    },
+      total: all.length,
+      pinned,
+    }
   })
 })
 
