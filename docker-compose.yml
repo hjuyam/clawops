@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - DATABASE_PATH=/app/data/clawops.db
+      - CONFIG_DIR=/app/config
+      - BACKUP_DIR=/app/backups
+      - GATEWAY_URL=http://gateway:8080
+    volumes:
+      - clawops-data:/app/data
+      - clawops-config:/app/config
+      - clawops-backups:/app/backups
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    image: nginx:alpine
+    ports:
+      - "3000:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./packages/frontend/dist:/usr/share/nginx/html:ro
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  clawops-data:
+  clawops-config:
+  clawops-backups:

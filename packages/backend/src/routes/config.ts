@@ -1,53 +1,56 @@
 import { Router } from 'express'
-import { requireAuth, AuthRequest } from '../middleware/auth.js'
-import { queries } from '../db/index.js'
-import { createAuditLog } from '../services/auth.js'
-import { v4 as uuidv4 } from 'uuid'
+import { requireAuth, AuthRequest, auditAction } from '../middleware/auth.js'
+import { queries, ConfigVersion } from '../db/index.js'
+import { 
+  listConfigFiles, 
+  readFile, 
+  writeFile, 
+  createBackup,
+  rollback,
+  getDiff,
+  validateConfig,
+  initDefaultConfigs
+} from '../services/configService.js'
 
 const router = Router()
 
-const CONFIG_FILES = [
-  { name: 'SOUL', path: 'SOUL.md', description: 'Core identity configuration' },
-  { name: 'AGENTS', path: 'AGENTS.md', description: 'Subagent definitions' },
-  { name: 'USER', path: 'USER.md', description: 'User preferences' },
-  { name: 'IDENTITY', path: 'IDENTITY.md', description: 'System identity' },
-  { name: 'HEARTBEAT', path: 'HEARTBEAT.md', description: 'Scheduled tasks config' },
-]
-
-router.get('/list', requireAuth, (_req: AuthRequest, res) => {
-  const files = CONFIG_FILES.map(f => {
-    const latest = queries.configVersions.getLatest.get(f.path) as { version: string; created_at: string } | undefined
-    return {
-      ...f,
-      exists: !!latest,
-      version: latest?.version,
-      last_modified: latest?.created_at,
-    }
-  })
-  
+router.get('/list', requireAuth, (_req, res) => {
+  const files = listConfigFiles()
   res.json({ success: true, data: files })
 })
 
 router.get('/file/:path', requireAuth, (req: AuthRequest, res) => {
   const { path: filePath } = req.params
-  const version = queries.configVersions.getLatest.get(filePath)
   
-  if (!version) {
-    return res.json({ success: true, data: { content: '', version: null } })
+  const fileData = readFile(filePath)
+  
+  if (!fileData) {
+    return res.json({ 
+      success: true, 
+      data: { 
+        content: '', 
+        hash: '',
+        version: null,
+        exists: false
+      } 
+    })
   }
   
-  res.json({ 
-    success: true, 
-    data: { 
-      content: (version as { content: string }).content,
-      version: (version as { version: string }).version,
-      hash: (version as { hash: string }).hash,
-      created_at: (version as { created_at: string }).created_at,
-    }
+  const latestVersion = queries.configVersions.getLatest.get(filePath) as ConfigVersion | undefined
+  
+  res.json({
+    success: true,
+    data: {
+      content: fileData.content,
+      hash: fileData.hash,
+      version: latestVersion?.version || null,
+      created_at: latestVersion?.created_at || null,
+      exists: true,
+    },
   })
 })
 
-router.post('/save', requireAuth, (req: AuthRequest, res) => {
+router.post('/save', requireAuth, auditAction('config_save'), (req: AuthRequest, res) => {
   const { path: filePath, content, reason } = req.body
   
   if (!filePath || content === undefined) {
@@ -58,36 +61,58 @@ router.post('/save', requireAuth, (req: AuthRequest, res) => {
     return res.status(400).json({ success: false, error: 'Reason is required for config changes' })
   }
   
-  const versionId = uuidv4()
-  const version = `v${Date.now()}`
-  const hash = require('crypto').createHash('sha256').update(content).digest('hex')
+  const validation = validateConfig(content)
+  if (!validation.valid) {
+    return res.status(400).json({ 
+      success: false, 
+      error: `Validation failed: ${validation.errors.join(', ')}` 
+    })
+  }
   
-  queries.configVersions.create.run({
-    id: versionId,
-    version,
-    hash,
-    file_path: filePath,
-    content,
-    created_by: req.user?.id,
-  })
+  try {
+    const result = writeFile(filePath, content, reason, req.user?.id || 'system')
+    
+    res.json({
+      success: true,
+      data: {
+        message: 'Configuration saved',
+        version: result.version.version,
+        version_id: result.version.id,
+        backup_id: result.backup.id,
+      },
+    })
+  } catch (error) {
+    res.status(500).json({ 
+      success: false, 
+      error: `Save failed: ${error instanceof Error ? error.message : 'Unknown error'}` 
+    })
+  }
+})
+
+router.post('/backup', requireAuth, auditAction('config_backup'), (req: AuthRequest, res) => {
+  const { path: filePath } = req.body
   
-  createAuditLog({
-    actor_id: req.user?.id,
-    action: 'config_save',
-    resource_type: 'config_file',
-    resource_id: filePath,
-    reason,
-    risk_level: 'high',
-  })
+  if (!filePath) {
+    return res.status(400).json({ success: false, error: 'Path is required' })
+  }
   
-  res.json({ 
-    success: true, 
-    data: { 
-      message: 'Configuration saved',
-      version,
-      version_id: versionId,
-    }
-  })
+  try {
+    const backup = createBackup(filePath, req.user?.id || 'system')
+    
+    res.json({
+      success: true,
+      data: {
+        message: 'Backup created',
+        backup_id: backup.id,
+        version_id: backup.version_id,
+      },
+    })
+  } catch (error) {
+    res.status(500).json({ 
+      success: false, 
+      error: `Backup failed: ${error instanceof Error ? error.message : 'Unknown error'}` 
+    })
+  }
 })
 
 router.get('/versions/:path', requireAuth, (req: AuthRequest, res) => {
@@ -97,7 +122,40 @@ router.get('/versions/:path', requireAuth, (req: AuthRequest, res) => {
   res.json({ success: true, data: versions })
 })
 
-router.post('/rollback', requireAuth, (req: AuthRequest, res) => {
+router.get('/diff/:path', requireAuth, (req: AuthRequest, res) => {
+  const { path: filePath } = req.params
+  const { from_version, to_version } = req.query
+  
+  if (!from_version || !to_version) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'from_version and to_version are required' 
+    })
+  }
+  
+  const fromVersion = queries.configVersions.findById.get(from_version as string) as ConfigVersion | undefined
+  const toVersion = queries.configVersions.findById.get(to_version as string) as ConfigVersion | undefined
+  
+  if (!fromVersion || !toVersion) {
+    return res.status(404).json({ success: false, error: 'Version not found' })
+  }
+  
+  const diff = getDiff(fromVersion.content || '', toVersion.content || '')
+  
+  res.json({
+    success: true,
+    data: {
+      file: filePath,
+      from_version: fromVersion.version,
+      to_version: toVersion.version,
+      diff,
+      additions: diff.filter(l => l.type === 'added').length,
+      deletions: diff.filter(l => l.type === 'removed').length,
+    },
+  })
+})
+
+router.post('/rollback', requireAuth, auditAction('config_rollback'), (req: AuthRequest, res) => {
   const { path: filePath, version_id, reason } = req.body
   
   if (!filePath || !version_id) {
@@ -108,28 +166,56 @@ router.post('/rollback', requireAuth, (req: AuthRequest, res) => {
     return res.status(400).json({ success: false, error: 'Reason is required for rollback' })
   }
   
-  const targetVersion = queries.configVersions.findById.get(version_id)
-  if (!targetVersion) {
-    return res.status(404).json({ success: false, error: 'Target version not found' })
+  try {
+    const result = rollback(filePath, version_id, reason, req.user?.id || 'system')
+    
+    res.json({
+      success: true,
+      data: {
+        message: 'Rollback completed',
+        rolled_back_to: result.version,
+        version_id: result.id,
+      },
+    })
+  } catch (error) {
+    res.status(500).json({ 
+      success: false, 
+      error: `Rollback failed: ${error instanceof Error ? error.message : 'Unknown error'}` 
+    })
+  }
+})
+
+router.post('/validate', requireAuth, (req: AuthRequest, res) => {
+  const { content } = req.body
+  
+  if (content === undefined) {
+    return res.status(400).json({ success: false, error: 'Content is required' })
   }
   
-  createAuditLog({
-    actor_id: req.user?.id,
-    action: 'config_rollback',
-    resource_type: 'config_file',
-    resource_id: filePath,
-    before_ref: (targetVersion as { version: string }).version,
-    reason,
-    risk_level: 'high',
-  })
+  const result = validateConfig(content)
   
-  res.json({ 
-    success: true, 
-    data: { 
-      message: 'Rollback completed',
-      rolled_back_to: (targetVersion as { version: string }).version,
-    }
+  res.json({
+    success: true,
+    data: {
+      valid: result.valid,
+      errors: result.errors,
+    },
   })
+})
+
+router.post('/init', requireAuth, (_req, res) => {
+  try {
+    initDefaultConfigs()
+    res.json({ 
+      success: true, 
+      data: { message: 'Default configurations initialized' } 
+    })
+  } catch (error) {
+    res.status(500).json({ 
+      success: false, 
+      error: `Init failed: ${error instanceof Error ? error.message : 'Unknown error'}` 
+    })
+  }
 })
 
 export { router as configRouter }

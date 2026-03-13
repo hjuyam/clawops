@@ -13,9 +13,11 @@
     "build": "npm run build --workspaces",
     "build:frontend": "npm run build --workspace=packages/frontend",
     "build:backend": "npm run build --workspace=packages/backend",
+    "start": "npm run start --workspace=packages/backend",
     "lint": "npm run lint --workspaces",
-    "test": "npm run test --workspaces",
-    "clean": "npm run clean --workspaces && rm -rf node_modules"
+    "test": "npm run test --workspaces --if-present",
+    "clean": "npm run clean --workspaces && rm -rf node_modules",
+    "init:config": "mkdir -p config backups data && cp -n .env.example .env 2>/dev/null || true"
   },
   "devDependencies": {
     "concurrently": "^8.2.2",
